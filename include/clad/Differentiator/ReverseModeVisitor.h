@@ -47,6 +47,9 @@ namespace clad {
   /// Used to compute derivatives by clad::gradient.
   class ReverseModeVisitor
       : public clang::ConstStmtVisitor<ReverseModeVisitor, StmtDiff>,
+        public clang::ConstOMPClauseVisitor<
+            ReverseModeVisitor,
+            std::pair<clang::OMPClause*, clang::OMPClause*>>,
         public VisitorBase {
   protected:
     // FIXME: We should remove friend-dependency of the plugin classes here.
@@ -125,6 +128,13 @@ namespace clad {
       if (push)
         m_Stack.pop();
       return result;
+    }
+
+    std::pair<clang::OMPClause*, clang::OMPClause*>
+    Visit(const clang::OMPClause* C) {
+      return clang::ConstOMPClauseVisitor<
+          ReverseModeVisitor,
+          std::pair<clang::OMPClause*, clang::OMPClause*>>::Visit(C);
     }
 
     /// Get the latest block of code (i.e. place for statements output).
@@ -432,6 +442,13 @@ namespace clad {
     StmtDiff VisitNullStmt(const clang::NullStmt* NS) {
       return StmtDiff{Clone(NS), Clone(NS)};
     }
+
+    std::pair<clang::OMPClause*, clang::OMPClause*>
+    VisitOMPReductionClause(const clang::OMPReductionClause* C);
+    StmtDiff
+    VisitOMPExecutableDirective(const clang::OMPExecutableDirective* D);
+    StmtDiff
+    VisitOMPParallelForDirective(const clang::OMPParallelForDirective* D);
 
     /// Helper function that builds `T* _this = malloc(sifeof(T));`
     /// and `free(_this)`.

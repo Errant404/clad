@@ -227,6 +227,8 @@ DerivativeAndOverload BaseForwardModeVisitor::Derive() {
   }
 
   endScope(); // Function decl scope
+  m_DiffReq->dumpColor();
+  result.first->dumpColor();
 
   return DerivativeAndOverload{result.first,
                                /*OverloadFunctionDecl=*/nullptr};

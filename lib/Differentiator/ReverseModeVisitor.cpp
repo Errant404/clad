@@ -378,6 +378,9 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
         m_Derivative->setLexicalDeclContext(RD->getParent());
       }
     }
+    m_DiffReq->dumpColor();
+    result.first->dumpColor();
+    result.first->getBody()->dumpPretty(m_Context);
 
     if (!shouldCreateOverload)
       return DerivativeAndOverload{result.first, /*overload=*/nullptr};
@@ -1425,6 +1428,8 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
       // with Sema::BuildDeclRefExpr. This is required in some cases, e.g.
       // Sema::BuildDeclRefExpr is responsible for adding captured fields
       // to the underlying struct of a lambda.
+      // TODO: 找出 _d_total 没有 refertocapture 的原因
+      // 第一次如果没带 refer 后面都不会带，因为被 clone
       if (VD->getDeclContext() != m_Sema.CurContext) {
         auto* ccDRE = dyn_cast<DeclRefExpr>(clonedDRE);
         NestedNameSpecifier* NNS = DRE->getQualifier();
@@ -1472,10 +1477,18 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
 
       if (!it->second)
         return StmtDiff(clonedDRE);
+
+      clang::Expr* dExpr = it->second;
+      if (auto dVarDRE = dyn_cast<DeclRefExpr>(dExpr)) {
+        auto dVar = cast<VarDecl>(dVarDRE->getDecl());
+        if (dVar->getDeclContext() != m_Sema.CurContext)
+          dExpr = BuildDeclRef(dVar, DRE->getQualifier());
+      }
+
       // Create the (_d_param[idx] += dfdx) statement.
-      if (Expr* add_assign = BuildDiffIncrement(it->second))
+      if (Expr* add_assign = BuildDiffIncrement(dExpr))
         addToCurrentBlock(add_assign, direction::reverse);
-      return StmtDiff(clonedDRE, it->second);
+      return StmtDiff(clonedDRE, dExpr);
     }
 
     return StmtDiff(clonedDRE);
