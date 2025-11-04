@@ -1,306 +1,260 @@
+#include "ConstantFolder.h"
 #include "clad/Differentiator/MultiplexExternalRMVSource.h"
 #include "clad/Differentiator/ReverseModeVisitor.h"
+
 #include <clang/AST/OpenMPClause.h>
 #include <clang/AST/StmtOpenMP.h>
 #include <clang/Basic/OpenMPKinds.h>
 #include <llvm/Frontend/OpenMP/OMP.h.inc>
 #include <llvm/Support/ErrorHandling.h>
 
-#include <numeric>
-#include <omp.h>
-
 using namespace clang;
 using namespace llvm::omp;
 
 namespace clad {
-/* Static OpenMP scheduler, identical to what LLVM would use. Each thread gets
-   one chunk of consecutive iterations. The number of iterations per chunk is
-   aproximately trip_count/num_threads. If the trip count can not be evenly
-   divided among threads, the first few threads get one extra iteration.
-   As long as the number of threads stays constant, and when called by the
-   same thread, this subroutine will always return the same threadstart and
-   threadend when given the same imin,imax,istride as input. */
-static void GetStaticSchedule(int lo, int hi, int stride, int* threadlo,
-                              int* threadhi) {
-  int trip_count = ((hi - lo + stride) / stride);
-  trip_count = std::max(trip_count, 0);
-
-  int nth = omp_get_num_threads();
-  int tid = omp_get_thread_num();
-
-  if (trip_count < nth) {
-    /* fewer iterations than threads. some threads will get one iteration,
-       the other threads will get nothing. */
-    if (tid < trip_count) {
-      /* do one iteration */
-      *threadlo = lo + tid * stride;
-      *threadhi = *threadlo;
-    } else {
-      /* do nothing */
-      *threadhi = 0;
-      *threadlo = *threadhi + stride;
-    }
-  }
-  /* at least one iteration per thread. since the total number of iterations may
-     not be evenly dividable by the number of threads, there will be a few extra
-     iterations. the first few threads will each get one of those, which results
-     in some offsetts that are applied to the start and end of the chunks. */
-  else {
-    int chunksize = trip_count / nth;
-    int extras = trip_count % nth;
-    int tidextras;
-    int incr;
-    if (tid < extras) {
-      tidextras = tid;
-      incr = 0;
-    } else {
-      tidextras = extras;
-      incr = stride;
-    }
-    *threadlo = lo + (tid * chunksize + tidextras) * stride;
-    *threadhi = *threadlo + chunksize * stride - incr;
-  }
-}
-
-ForStmt* ReverseModeVisitor::DifferentiateCanonicalLoop(ForStmt* S) {
-  if (!S)
-    return nullptr;
-
-  ASTContext& Ctx = m_Sema.getASTContext();
-  SourceLocation Loc = S->getForLoc();
+StmtDiff ReverseModeVisitor::DifferentiateCanonicalLoop(const ForStmt* S) {
+  // OpenMP canonical loops have the form:
+  // for (init-expr; test-expr; incr-expr) structured-block
+  // where init-expr: var = lb
+  //       test-expr: var relational-op ub
+  //       incr-expr: ++var, var++, --var, var--, var += incr, var -= incr,
+  //                  var = var + incr, var = incr + var, var = var - incr
 
   // Extract loop components
-  Stmt* Init = S->getInit();
-  Expr* Cond = S->getCond();
-  Expr* Inc = S->getInc();
-  Stmt* Body = S->getBody();
+  const Stmt* Init = S->getInit();
+  const Expr* Cond = S->getCond();
+  const Expr* Inc = S->getInc();
+  const Stmt* Body = S->getBody();
 
-  if (!Init || !Cond || !Inc || !Body)
-    return nullptr;
+  assert(Init && Cond && Inc && Body);
 
-  // Extract loop variable from initialization
-  // In canonical form: int i = istart or existing var assigned
-  VarDecl* LoopVar = nullptr;
-  Expr* InitValue = nullptr;
+  // Extract loop variable, lower bound, upper bound, and stride
+  const VarDecl* LoopVarDecl = nullptr;
+  Expr* LowerBound = nullptr;
+  Expr* UpperBound = nullptr;
+  Expr* Stride = nullptr;
 
-  if (auto* DS = dyn_cast<DeclStmt>(Init)) {
+  // Parse init expression: var = lb
+  // Handle both DeclStmt (int i = 0) and BinaryOperator (i = 0)
+  if (const auto* DS = dyn_cast<DeclStmt>(Init)) {
     if (DS->isSingleDecl()) {
-      LoopVar = dyn_cast<VarDecl>(DS->getSingleDecl());
-      if (LoopVar && LoopVar->hasInit())
-        InitValue = LoopVar->getInit();
+      LoopVarDecl = dyn_cast<VarDecl>(DS->getSingleDecl());
+      if (LoopVarDecl && LoopVarDecl->hasInit())
+        LowerBound = Clone(LoopVarDecl->getInit());
     }
-  } else if (auto* BinOp = dyn_cast<BinaryOperator>(Init)) {
-    if (BinOp->getOpcode() == BO_Assign) {
-      if (auto* DRE = dyn_cast<DeclRefExpr>(BinOp->getLHS())) {
-        LoopVar = dyn_cast<VarDecl>(DRE->getDecl());
-        InitValue = BinOp->getRHS();
+  } else if (const auto* BO = dyn_cast<BinaryOperator>(Init)) {
+    if (BO->getOpcode() == BO_Assign) {
+      const Expr* LHS = BO->getLHS()->IgnoreImplicitAsWritten();
+      if (const auto* DRE = dyn_cast<DeclRefExpr>(LHS)) {
+        LoopVarDecl = dyn_cast<VarDecl>(DRE->getDecl());
+        LowerBound = Clone(BO->getRHS());
       }
     }
   }
 
-  if (!LoopVar || !InitValue)
-    return nullptr;
+  // Parse condition expression: var < ub, var <= ub, etc.
+  // Need to handle implicit casts and other wrappers
+  const Expr* CondExpr = Cond->IgnoreImplicitAsWritten();
+  if (const auto* BO = dyn_cast<BinaryOperator>(CondExpr)) {
+    // Try to match: var relop ub
+    const Expr* LHS = BO->getLHS()->IgnoreImplicitAsWritten();
+    const Expr* RHS = BO->getRHS()->IgnoreImplicitAsWritten();
 
-  // Extract condition: i < iend, i <= iend, i > istart, i >= istart
-  auto* CondBinOp = dyn_cast<BinaryOperator>(Cond);
-  if (!CondBinOp)
-    return nullptr;
-
-  BinaryOperatorKind CondOp = CondBinOp->getOpcode();
-  Expr* CondLHS = CondBinOp->getLHS();
-  Expr* CondRHS = CondBinOp->getRHS();
-
-  // Verify LHS is loop variable
-  auto* CondVarRef = dyn_cast<DeclRefExpr>(CondLHS->IgnoreParenImpCasts());
-  if (!CondVarRef || CondVarRef->getDecl() != LoopVar)
-    return nullptr;
-
-  Expr* BoundExpr = CondRHS;
-
-  // Determine loop direction and extract step
-  bool IsIncreasing = false;
-  Expr* StepExpr = nullptr;
-  bool IsStepNegated = false;
-
-  // Analyze increment expression
-  if (auto* UnaryInc = dyn_cast<UnaryOperator>(Inc)) {
-    UnaryOperatorKind UOp = UnaryInc->getOpcode();
-    if (UOp == UO_PreInc || UOp == UO_PostInc) {
-      IsIncreasing = true;
-      StepExpr = IntegerLiteral::Create(
-          Ctx, llvm::APInt(Ctx.getIntWidth(LoopVar->getType()), 1),
-          LoopVar->getType(), Loc);
-    } else if (UOp == UO_PreDec || UOp == UO_PostDec) {
-      IsIncreasing = false;
-      StepExpr = IntegerLiteral::Create(
-          Ctx, llvm::APInt(Ctx.getIntWidth(LoopVar->getType()), 1),
-          LoopVar->getType(), Loc);
-    } else {
-      return nullptr;
-    }
-  } else if (auto* BinInc = dyn_cast<BinaryOperator>(Inc)) {
-    BinaryOperatorKind IncOp = BinInc->getOpcode();
-    if (IncOp == BO_AddAssign) {
-      IsIncreasing = true;
-      StepExpr = BinInc->getRHS();
-    } else if (IncOp == BO_SubAssign) {
-      IsIncreasing = false;
-      StepExpr = BinInc->getRHS();
-    } else {
-      return nullptr;
-    }
-  } else if (auto* CallInc = dyn_cast<CXXOperatorCallExpr>(Inc)) {
-    OverloadedOperatorKind OOK = CallInc->getOperator();
-    if (OOK == OO_PlusPlus) {
-      IsIncreasing = true;
-      StepExpr = IntegerLiteral::Create(
-          Ctx, llvm::APInt(Ctx.getIntWidth(LoopVar->getType()), 1),
-          LoopVar->getType(), Loc);
-    } else if (OOK == OO_MinusMinus) {
-      IsIncreasing = false;
-      StepExpr = IntegerLiteral::Create(
-          Ctx, llvm::APInt(Ctx.getIntWidth(LoopVar->getType()), 1),
-          LoopVar->getType(), Loc);
-    } else if (OOK == OO_PlusEqual) {
-      IsIncreasing = true;
-      StepExpr = CallInc->getArg(1);
-    } else if (OOK == OO_MinusEqual) {
-      IsIncreasing = false;
-      StepExpr = CallInc->getArg(1);
-    } else {
-      return nullptr;
-    }
-  } else {
-    return nullptr;
-  }
-
-  if (!StepExpr)
-    return nullptr;
-
-  // Verify condition matches loop direction
-  bool CondMatchesDirection = false;
-  if (IsIncreasing && (CondOp == BO_LT || CondOp == BO_LE))
-    CondMatchesDirection = true;
-  else if (!IsIncreasing && (CondOp == BO_GT || CondOp == BO_GE))
-    CondMatchesDirection = true;
-
-  if (!CondMatchesDirection)
-    return nullptr;
-
-  // Now construct the reversed loop
-  // For increasing loop: for (i = istart; i < iend; i += step)
-  //   becomes: for (i = iend - 1; i >= istart; i -= step)
-  // For decreasing loop: for (i = istart; i > iend; i -= step)
-  //   becomes: for (i = iend + 1; i <= istart; i += step)
-
-  QualType LoopVarType = LoopVar->getType();
-
-  // Calculate new initial value
-  Expr* NewInitValue = nullptr;
-  if (IsIncreasing) {
-    // iend - 1 (or iend if original was <=)
-    Expr* OneExpr = IntegerLiteral::Create(
-        Ctx, llvm::APInt(Ctx.getIntWidth(LoopVarType), 1), LoopVarType, Loc);
-
-    if (CondOp == BO_LT) {
-      // i < iend becomes i >= iend - 1
-      NewInitValue = BuildOp(BO_Sub, BoundExpr, OneExpr);
-    } else {
-      // i <= iend becomes i >= iend  (no adjustment needed)
-      NewInitValue = BoundExpr;
-    }
-  } else {
-    // iend + 1 (or iend if original was >=)
-    Expr* OneExpr = IntegerLiteral::Create(
-        Ctx, llvm::APInt(Ctx.getIntWidth(LoopVarType), 1), LoopVarType, Loc);
-
-    if (CondOp == BO_GT) {
-      // i > iend becomes i <= iend + 1
-      NewInitValue = BuildOp(BO_Add, BoundExpr, OneExpr);
-    } else {
-      // i >= iend becomes i <= iend (no adjustment needed)
-      NewInitValue = BoundExpr;
+    if (const auto* DRE = dyn_cast<DeclRefExpr>(LHS)) {
+      if (DRE->getDecl() == LoopVarDecl) {
+        // Pattern: var < ub, var <= ub, var != ub
+        UpperBound = Clone(BO->getRHS());
+      }
+    } else if (const auto* DRE = dyn_cast<DeclRefExpr>(RHS)) {
+      if (DRE->getDecl() == LoopVarDecl) {
+        // Pattern: ub > var, ub >= var, ub != var (reversed)
+        UpperBound = Clone(BO->getLHS());
+      }
     }
   }
 
-  if (!NewInitValue)
-    return nullptr;
+  // Parse increment expression and extract stride
+  // Supported forms: ++var, var++, var += incr, var = var + incr, etc.
+  Stride = ConstantFolder::synthesizeLiteral(m_Context.IntTy, m_Context,
+                                             /*val=*/1); // Default stride
+  bool IsIncrement = true; // true for +=, false for -=
 
-  // Create new initialization
-  Stmt* NewInit = nullptr;
-  if (isa<DeclStmt>(Init)) {
-    // Create a new VarDecl with the new initial value
-    VarDecl* NewLoopVar =
-        BuildVarDecl(LoopVar->getType(), LoopVar->getIdentifier());
-    NewLoopVar->setInit(NewInitValue);
-    NewLoopVar->setInitStyle(LoopVar->getInitStyle());
-
-    NewInit = BuildDeclStmt(NewLoopVar);
-  } else {
-    // Assignment form
-    DeclRefExpr* VarRef = BuildDeclRef(LoopVar);
-
-    NewInit = BuildOp(BO_Assign, VarRef, NewInitValue);
+  if (const auto* UO = dyn_cast<UnaryOperator>(Inc)) {
+    // ++var or var++, --var or var--
+    IsIncrement =
+        (UO->getOpcode() == UO_PreInc || UO->getOpcode() == UO_PostInc);
+    Stride = ConstantFolder::synthesizeLiteral(m_Context.IntTy, m_Context,
+                                               /*val=*/1);
+  } else if (const auto* BO = dyn_cast<BinaryOperator>(Inc)) {
+    if (BO->getOpcode() == BO_AddAssign) {
+      IsIncrement = true;
+      Stride = Clone(BO->getRHS());
+    } else if (BO->getOpcode() == BO_SubAssign) {
+      IsIncrement = false;
+      Stride = Clone(BO->getRHS());
+    } else if (BO->getOpcode() == BO_Assign) {
+      // var = var + incr or var = var - incr
+      if (const auto* InnerBO = dyn_cast<BinaryOperator>(BO->getRHS())) {
+        if (InnerBO->getOpcode() == BO_Add) {
+          IsIncrement = true;
+          // Check which side is the variable
+          if (const auto* DRE = dyn_cast<DeclRefExpr>(InnerBO->getLHS())) {
+            if (DRE->getDecl() == LoopVarDecl)
+              Stride = Clone(InnerBO->getRHS());
+          } else if (const auto* DRE =
+                         dyn_cast<DeclRefExpr>(InnerBO->getRHS())) {
+            if (DRE->getDecl() == LoopVarDecl)
+              Stride = Clone(InnerBO->getLHS());
+          }
+        } else if (InnerBO->getOpcode() == BO_Sub) {
+          IsIncrement = false;
+          if (const auto* DRE = dyn_cast<DeclRefExpr>(InnerBO->getLHS())) {
+            if (DRE->getDecl() == LoopVarDecl)
+              Stride = Clone(InnerBO->getRHS());
+          }
+        }
+      }
+    }
   }
 
-  if (!NewInit)
-    return nullptr;
+  assert(LoopVarDecl && LowerBound && UpperBound && Stride);
 
-  // Create new condition
-  DeclRefExpr* NewCondVarRef = BuildDeclRef(LoopVar);
+  // If stride is negative (decrement), negate it for getStaticSchedule
+  if (!IsIncrement)
+    Stride = BuildOp(UO_Minus, Stride);
 
-  BinaryOperatorKind NewCondOp;
-  if (IsIncreasing)
-    NewCondOp = (CondOp == BO_LT || CondOp == BO_LE) ? BO_GE : BO_LE;
-  else
-    NewCondOp = (CondOp == BO_GT || CondOp == BO_GE) ? BO_LE : BO_GE;
+  // Create variables for chunk bounds: threadlo, threadhi
+  QualType IntTy = m_Context.IntTy;
+  IdentifierInfo* ThreadLoII = CreateUniqueIdentifier("_t_chunklo");
+  VarDecl* ThreadLoDecl = BuildVarDecl(IntTy, ThreadLoII, getZeroInit(IntTy));
 
-  Expr* NewCond = BuildOp(NewCondOp, NewCondVarRef, InitValue);
-  if (!NewCond)
-    return nullptr;
+  IdentifierInfo* ThreadHiII = CreateUniqueIdentifier("_t_chunkhi");
+  VarDecl* ThreadHiDecl = BuildVarDecl(IntTy, ThreadHiII, getZeroInit(IntTy));
 
-  // Create new increment
-  DeclRefExpr* NewIncVarRef = BuildDeclRef(LoopVar);
+  // Build call to GetStaticSchedule(lo, hi, stride, &threadlo, &threadhi)
+  llvm::SmallVector<Expr*, 5> ScheduleCallArgs;
+  ScheduleCallArgs.push_back(LowerBound);
+  ScheduleCallArgs.push_back(UpperBound);
+  ScheduleCallArgs.push_back(Stride);
+  ScheduleCallArgs.push_back(BuildOp(UO_AddrOf, BuildDeclRef(ThreadLoDecl)));
+  ScheduleCallArgs.push_back(BuildOp(UO_AddrOf, BuildDeclRef(ThreadHiDecl)));
 
-  Expr* NewInc = nullptr;
-  if (auto* UnaryInc = dyn_cast<UnaryOperator>(Inc)) {
-    UnaryOperatorKind UOp = UnaryInc->getOpcode();
-    UnaryOperatorKind NewUOp;
-    if (UOp == UO_PreInc)
-      NewUOp = UO_PreDec;
-    else if (UOp == UO_PostInc)
-      NewUOp = UO_PostDec;
-    else if (UOp == UO_PreDec)
-      NewUOp = UO_PreInc;
-    else if (UOp == UO_PostDec)
-      NewUOp = UO_PostInc;
-    else
-      return nullptr;
+  Expr* ScheduleCall =
+      GetFunctionCall("GetStaticSchedule", "clad", ScheduleCallArgs);
 
-    NewInc = BuildOp(NewUOp, NewIncVarRef);
-  } else if (isa<BinaryOperator>(Inc) || isa<CXXOperatorCallExpr>(Inc)) {
-    // For compound assignment, reverse the operation
-    BinaryOperatorKind NewIncOp = IsIncreasing ? BO_SubAssign : BO_AddAssign;
-    NewInc = BuildOp(NewIncOp, NewIncVarRef, StepExpr);
+  // Create forward sweep loop: for (i = threadlo; i <= threadhi; i += stride)
+  // Use unique identifier to avoid conflicts when differentiating multiple
+  // times
+  IdentifierInfo* FwdLoopVarII =
+      CreateUniqueIdentifier(LoopVarDecl->getNameAsString());
+  VarDecl* FwdLoopVar = BuildVarDecl(LoopVarDecl->getType(), FwdLoopVarII,
+                                     BuildDeclRef(ThreadLoDecl));
+
+  Stmt* FwdInit = BuildDeclStmt(FwdLoopVar);
+
+  // Condition: i <= threadhi (or appropriate comparison based on original)
+  Expr* FwdCond =
+      BuildOp(BO_LE, BuildDeclRef(FwdLoopVar), BuildDeclRef(ThreadHiDecl));
+
+  // Increment: i += stride
+  Expr* FwdInc = BuildOp(BO_AddAssign, BuildDeclRef(FwdLoopVar), Clone(Stride));
+
+  // Register loop variable replacement for Visit
+  // This ensures references to the original loop variable in the body
+  // are replaced with the new forward loop variable
+  m_DeclReplacements[LoopVarDecl] = FwdLoopVar;
+
+  // Differentiate the loop body for forward sweep
+  StmtDiff BodyDiff = Visit(Body);
+
+  // Clear the replacement after Visit
+  m_DeclReplacements.erase(LoopVarDecl);
+
+  // Build forward loop
+  Stmt* ForwardLoop =
+      new (m_Context) ForStmt(m_Context, FwdInit, FwdCond, nullptr, FwdInc,
+                              BodyDiff.getStmt(), noLoc, noLoc, noLoc);
+
+  // For reverse loop, we need to create all variables first, then Visit
+  // Create reverse chunk variables
+  VarDecl* RevThreadLoDecl = BuildVarDecl(
+      IntTy, CreateUniqueIdentifier("_t_chunklo"), getZeroInit(IntTy));
+  VarDecl* RevThreadHiDecl = BuildVarDecl(
+      IntTy, CreateUniqueIdentifier("_t_chunkhi"), getZeroInit(IntTy));
+
+  // Create reverse loop variable
+  IdentifierInfo* RevLoopVarII =
+      CreateUniqueIdentifier(LoopVarDecl->getNameAsString());
+  VarDecl* RevLoopVar = BuildVarDecl(LoopVarDecl->getType(), RevLoopVarII,
+                                     BuildDeclRef(RevThreadHiDecl));
+
+  // For reverse loop, Visit again with the reverse loop variable
+  Stmt* ReverseLoopBody = nullptr;
+  if (BodyDiff.getStmt_dx()) {
+    // Register the reverse loop variable replacement
+    m_DeclReplacements[LoopVarDecl] = RevLoopVar;
+
+    // Visit the body again to get the reverse sweep with correct variable refs
+    StmtDiff RevBodyDiff = Visit(Body);
+    ReverseLoopBody = RevBodyDiff.getStmt_dx();
+
+    // Clear the replacement
+    m_DeclReplacements.erase(LoopVarDecl);
   }
 
-  if (!NewInc)
-    return nullptr;
+  // Create compound statement with declarations and loops
+  // Forward: { int threadlo = 0, threadhi = 0;
+  //            GetStaticSchedule(...);
+  //            for (...) {...} }
+  beginBlock(direction::forward);
+  addToCurrentBlock(BuildDeclStmt(ThreadLoDecl));
+  addToCurrentBlock(BuildDeclStmt(ThreadHiDecl));
+  addToCurrentBlock(ScheduleCall);
+  addToCurrentBlock(ForwardLoop);
+  Stmt* ForwardBlock = endBlock(direction::forward);
 
-  // Create the new ForStmt
-  auto NewCondResult = Sema::ConditionResult(
-      m_Sema.ActOnCondition(nullptr, Loc, NewCond, Sema::ConditionKind::Boolean,
-                            /*MissingOK=*/true));
-  Sema::FullExprArg FullNewInc = m_Sema.MakeFullDiscardedValueExpr(NewInc);
+  // Reverse: { int threadlo = 0, threadhi = 0;
+  //            GetStaticSchedule(...);
+  //            for (...) {...} }
+  Stmt* ReverseBlock = nullptr;
+  if (ReverseLoopBody) {
+    // Use the chunk variables we already created
+    llvm::SmallVector<Expr*, 5> RevScheduleCallArgs;
+    RevScheduleCallArgs.push_back(Clone(LowerBound));
+    RevScheduleCallArgs.push_back(Clone(UpperBound));
+    RevScheduleCallArgs.push_back(Clone(Stride));
+    RevScheduleCallArgs.push_back(
+        BuildOp(UO_AddrOf, BuildDeclRef(RevThreadLoDecl)));
+    RevScheduleCallArgs.push_back(
+        BuildOp(UO_AddrOf, BuildDeclRef(RevThreadHiDecl)));
 
-  StmtResult Result = m_Sema.ActOnForStmt(S->getForLoc(), S->getLParenLoc(),
-                                          NewInit, NewCondResult, FullNewInc,
-                                          S->getRParenLoc(), Clone(Body));
+    Expr* RevScheduleCall =
+        GetFunctionCall("GetStaticSchedule", "clad", RevScheduleCallArgs);
 
-  if (Result.isInvalid())
-    return nullptr;
+    // Create the reverse loop using the already-created loop variable
+    Stmt* RevInit = BuildDeclStmt(RevLoopVar);
 
-  return dyn_cast<ForStmt>(Result.get());
+    // Condition: i_rev >= threadlo
+    Expr* RevCond =
+        BuildOp(BO_GE, BuildDeclRef(RevLoopVar), BuildDeclRef(RevThreadLoDecl));
+
+    // Decrement: i_rev -= stride
+    Expr* RevInc =
+        BuildOp(BO_SubAssign, BuildDeclRef(RevLoopVar), Clone(Stride));
+
+    Stmt* ReverseLoop =
+        new (m_Context) ForStmt(m_Context, RevInit, RevCond, nullptr, RevInc,
+                                ReverseLoopBody, noLoc, noLoc, noLoc);
+
+    beginBlock(direction::reverse);
+    addToCurrentBlock(ReverseLoop, direction::reverse);
+    addToCurrentBlock(RevScheduleCall, direction::reverse);
+    addToCurrentBlock(BuildDeclStmt(RevThreadHiDecl), direction::reverse);
+    addToCurrentBlock(BuildDeclStmt(RevThreadLoDecl), direction::reverse);
+    ReverseBlock = endBlock(direction::reverse);
+  }
+
+  return {ForwardBlock, ReverseBlock};
 }
 
 std::pair<OMPClause*, OMPClause*>
@@ -354,83 +308,65 @@ StmtDiff ReverseModeVisitor::VisitOMPExecutableDirective(
           noLoc, noLoc));
   StmtDiff AssociatedSDiff;
   if (D->hasAssociatedStmt() && D->getAssociatedStmt()) {
-    auto processBody = [&]() -> StmtDiff {
-      CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema).ActOnOpenMPRegionStart(
-          D->getDirectiveKind(), getCurrentScope());
-      StmtDiff Body;
-      {
-        Sema::CompoundScopeRAII CompoundScope(m_Sema);
-        const auto* CS = D->getInnermostCapturedStmt()->getCapturedStmt();
-        if (isOpenMPLoopDirective(D->getDirectiveKind())) {
-          const auto* FS = cast<ForStmt>(CS);
-          const auto* init = FS->getInit();
-          StmtDiff initResult =
-              init ? DifferentiateSingleStmt(init) : StmtDiff{};
+    const auto* CS = D->getInnermostCapturedStmt()->getCapturedStmt();
 
-          StmtDiff condVarRes;
-          VarDecl* condVarClone = nullptr;
-          if (FS->getConditionVariable()) {
-            condVarRes =
-                DifferentiateSingleStmt(FS->getConditionVariableDeclStmt());
-            if (isa<DeclStmt>(condVarRes.getStmt())) {
-              Decl* decl =
-                  cast<DeclStmt>(condVarRes.getStmt())->getSingleDecl();
-              condVarClone = cast<VarDecl>(decl);
-            }
-          }
-          StmtDiff condDiff;
-          StmtDiff condExprDiff;
-          if (FS->getCond())
-            std::tie(condDiff, condExprDiff) =
-                DifferentiateSingleExpr(FS->getCond());
+    // For reverse mode, we need to create two separate OpenMP regions:
+    // one for the forward sweep and one for the reverse sweep.
+    // Each region needs its own ActOnOpenMPRegionStart/End to properly
+    // track variable captures.
 
-          StmtDiff incDiff;
-          StmtDiff incExprDiff;
-          if (const Expr* inc = FS->getInc()) {
-            std::tie(incDiff, incExprDiff) = DifferentiateSingleExpr(inc);
-            auto CommaJoin = [this](Expr* Acc, Stmt* S) {
-              Expr* E = cast<Expr>(S);
-              return BuildOp(BO_Comma, E, BuildParens(Acc));
-            };
-            auto* Additional = cast<CompoundStmt>(incDiff.getStmt());
-            incDiff.updateStmt(std::accumulate(
-                Additional->body_rbegin(), Additional->body_rend(),
-                incExprDiff.getExpr(), CommaJoin));
-          }
-          auto BodyDiff = Visit(FS->getBody());
-          Stmt* Forward = new (m_Context)
-              ForStmt(m_Context, initResult.getStmt(), condExprDiff.getExpr(),
-                      condVarClone, incDiff.getExpr(), BodyDiff.getStmt(),
-                      noLoc, noLoc, noLoc);
+    // Create forward OpenMP region
+    Stmt* Forward = nullptr;
+    CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema).ActOnOpenMPRegionStart(
+        OMPD_parallel, getCurrentScope());
+    StmtDiff ForwardBodyDiff;
+    {
+      Sema::CompoundScopeRAII CompoundScope(m_Sema);
 
-          Stmt* Reverse = new (m_Context)
-              ForStmt(m_Context, initResult.getStmt(), condExprDiff.getExpr(),
-                      condVarClone, incDiff.getExpr(), BodyDiff.getStmt_dx(),
-                      noLoc, noLoc, noLoc);
-          return {Forward, Reverse};
-        }
-        return Visit(CS);
+      if (isOpenMPLoopDirective(D->getDirectiveKind())) {
+        const auto* FS = cast<ForStmt>(CS);
+        ForwardBodyDiff = DifferentiateCanonicalLoop(FS);
+      } else {
+        ForwardBodyDiff = Visit(CS);
       }
-    };
-    Stmt* Forward =
+    }
+    Forward = CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema)
+                  .ActOnOpenMPRegionEnd(ForwardBodyDiff.getStmt(), OrigClauses)
+                  .get();
+
+    // Create reverse OpenMP region
+    // We need to re-differentiate to ensure proper variable capture tracking,
+    // but we'll use the reverse body from ForwardBodyDiff
+    Stmt* Reverse = nullptr;
+    CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema).ActOnOpenMPRegionStart(
+        OMPD_parallel, getCurrentScope());
+    // Re-differentiate to track captures in the reverse region
+    StmtDiff ReverseBodyDiff;
+    {
+      Sema::CompoundScopeRAII CompoundScope(m_Sema);
+      if (isOpenMPLoopDirective(D->getDirectiveKind())) {
+        const auto* FS = cast<ForStmt>(CS);
+        ReverseBodyDiff = DifferentiateCanonicalLoop(FS);
+      } else {
+        ReverseBodyDiff = Visit(CS);
+      }
+    }
+    Reverse =
         CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema)
-            .ActOnOpenMPRegionEnd(processBody().getStmt(), OrigClauses)
+            .ActOnOpenMPRegionEnd(ReverseBodyDiff.getStmt_dx(), DiffClauses)
             .get();
-    Stmt* Reverse =
-        CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema)
-            .ActOnOpenMPRegionEnd(processBody().getStmt_dx(), DiffClauses)
-            .get();
+
     AssociatedSDiff = {Forward, Reverse};
   }
   DeclarationNameInfo DirName;
   OpenMPDirectiveKind CancelRegion = OMPD_unknown;
   return {CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema)
               .ActOnOpenMPExecutableDirective(
-                  D->getDirectiveKind(), DirName, CancelRegion, OrigClauses,
+                  OMPD_parallel, DirName, CancelRegion, OrigClauses,
                   AssociatedSDiff.getStmt(), D->getBeginLoc(), D->getEndLoc())
               .get(),
           CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema)
-              .ActOnOpenMPExecutableDirective(D->getDirectiveKind(), DirName,
+              .ActOnOpenMPExecutableDirective(OMPD_parallel, DirName,
                                               CancelRegion, DiffClauses,
                                               AssociatedSDiff.getStmt_dx(),
                                               D->getBeginLoc(), D->getEndLoc())
@@ -440,7 +376,7 @@ StmtDiff ReverseModeVisitor::VisitOMPParallelForDirective(
     const clang::OMPParallelForDirective* D) {
   DeclarationNameInfo DirName;
   CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema).StartOpenMPDSABlock(
-      OMPD_parallel_for, DirName, getCurrentScope(), D->getBeginLoc());
+      OMPD_parallel, DirName, getCurrentScope(), D->getBeginLoc());
   StmtDiff SDiff = VisitOMPExecutableDirective(D);
   CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema).EndOpenMPDSABlock(SDiff.getStmt());
   return SDiff;

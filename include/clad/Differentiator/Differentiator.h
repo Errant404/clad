@@ -27,6 +27,7 @@
 #include <iterator>
 #include <type_traits>
 #include <utility>
+#include <omp.h>
 #ifndef __CUDACC__
 #include <mutex>
 #endif
@@ -47,9 +48,6 @@ inline CUDA_HOST_DEVICE unsigned int GetLength(const char* code) {
 #endif
   return count;
 }
-
-void GetStaticSchedule(int lo, int hi, int stride, int* threadlo,
-                           int* threadhi);
 
 #ifdef __CUDACC__
 #define CUDA_ARGS bool CUDAkernel, dim3 grid, dim3 block,
@@ -789,6 +787,55 @@ CUDA_HOST_DEVICE void push(tape<T[N], SBO_SIZE, SLAB_SIZE>& to, const U& val) {
 
   // Gradient Structure for Reverse Mode Enzyme
   template <unsigned N> struct EnzymeGradient { double d_arr[N]; };
+
+  /* Static OpenMP scheduler, identical to what LLVM would use. Each thread gets
+   one chunk of consecutive iterations. The number of iterations per chunk is
+   aproximately trip_count/num_threads. If the trip count can not be evenly
+   divided among threads, the first few threads get one extra iteration.
+   As long as the number of threads stays constant, and when called by the
+   same thread, this subroutine will always return the same threadstart and
+   threadend when given the same imin,imax,istride as input. */
+void GetStaticSchedule(int lo, int hi, int stride, int* threadlo,
+                              int* threadhi) {
+  int trip_count = ((hi - lo + stride) / stride);
+  trip_count = std::max(trip_count, 0);
+
+  int nth = omp_get_num_threads();
+  int tid = omp_get_thread_num();
+
+  if (trip_count < nth) {
+    /* fewer iterations than threads. some threads will get one iteration,
+       the other threads will get nothing. */
+    if (tid < trip_count) {
+      /* do one iteration */
+      *threadlo = lo + tid * stride;
+      *threadhi = *threadlo;
+    } else {
+      /* do nothing */
+      *threadhi = 0;
+      *threadlo = *threadhi + stride;
+    }
+  }
+  /* at least one iteration per thread. since the total number of iterations may
+     not be evenly dividable by the number of threads, there will be a few extra
+     iterations. the first few threads will each get one of those, which results
+     in some offsetts that are applied to the start and end of the chunks. */
+  else {
+    int chunksize = trip_count / nth;
+    int extras = trip_count % nth;
+    int tidextras = 0;
+    int incr = 0;
+    if (tid < extras) {
+      tidextras = tid;
+      incr = 0;
+    } else {
+      tidextras = extras;
+      incr = stride;
+    }
+    *threadlo = lo + (tid * chunksize + tidextras) * stride;
+    *threadhi = *threadlo + chunksize * stride - incr;
+  }
+}
   } // namespace clad
 #endif // CLAD_DIFFERENTIATOR
 
