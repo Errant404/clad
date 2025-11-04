@@ -48,6 +48,9 @@ inline CUDA_HOST_DEVICE unsigned int GetLength(const char* code) {
   return count;
 }
 
+void GetStaticSchedule(int lo, int hi, int stride, int* threadlo,
+                           int* threadhi);
+
 #ifdef __CUDACC__
 #define CUDA_ARGS bool CUDAkernel, dim3 grid, dim3 block,
 #define CUDA_REST_ARGS size_t shared_mem, cudaStream_t stream,

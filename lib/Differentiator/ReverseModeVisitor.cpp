@@ -1428,8 +1428,6 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
       // with Sema::BuildDeclRefExpr. This is required in some cases, e.g.
       // Sema::BuildDeclRefExpr is responsible for adding captured fields
       // to the underlying struct of a lambda.
-      // TODO: 找出 _d_total 没有 refertocapture 的原因
-      // 第一次如果没带 refer 后面都不会带，因为被 clone
       if (VD->getDeclContext() != m_Sema.CurContext) {
         auto* ccDRE = dyn_cast<DeclRefExpr>(clonedDRE);
         NestedNameSpecifier* NNS = DRE->getQualifier();

@@ -738,6 +738,8 @@ namespace clad {
       return &m_SwitchStmtsData.back();
     }
 
+    StmtDiff DifferentiateCanonicalLoop(const clang::ForStmt* S);
+
     void PopSwitchStmtInfo() { m_SwitchStmtsData.pop_back(); }
 
   private:
