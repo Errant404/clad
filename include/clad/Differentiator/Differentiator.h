@@ -25,9 +25,9 @@
 #include <cstddef>
 #include <cstring>
 #include <iterator>
+#include <omp.h>
 #include <type_traits>
 #include <utility>
-#include <omp.h>
 #ifndef __CUDACC__
 #include <mutex>
 #endif
@@ -795,47 +795,48 @@ CUDA_HOST_DEVICE void push(tape<T[N], SBO_SIZE, SLAB_SIZE>& to, const U& val) {
    As long as the number of threads stays constant, and when called by the
    same thread, this subroutine will always return the same threadstart and
    threadend when given the same imin,imax,istride as input. */
-void GetStaticSchedule(int lo, int hi, int stride, int* threadlo,
-                              int* threadhi) {
-  int trip_count = ((hi - lo + stride) / stride);
-  trip_count = std::max(trip_count, 0);
+  void GetStaticSchedule(int lo, int hi, int stride, int* threadlo,
+                         int* threadhi) {
+    int trip_count = ((hi - lo + stride) / stride);
+    trip_count = std::max(trip_count, 0);
 
-  int nth = omp_get_num_threads();
-  int tid = omp_get_thread_num();
+    int nth = omp_get_num_threads();
+    int tid = omp_get_thread_num();
 
-  if (trip_count < nth) {
-    /* fewer iterations than threads. some threads will get one iteration,
-       the other threads will get nothing. */
-    if (tid < trip_count) {
-      /* do one iteration */
-      *threadlo = lo + tid * stride;
-      *threadhi = *threadlo;
-    } else {
-      /* do nothing */
-      *threadhi = 0;
-      *threadlo = *threadhi + stride;
+    if (trip_count < nth) {
+      /* fewer iterations than threads. some threads will get one iteration,
+         the other threads will get nothing. */
+      if (tid < trip_count) {
+        /* do one iteration */
+        *threadlo = lo + tid * stride;
+        *threadhi = *threadlo;
+      } else {
+        /* do nothing */
+        *threadhi = 0;
+        *threadlo = *threadhi + stride;
+      }
+    }
+    /* at least one iteration per thread. since the total number of iterations
+       may not be evenly dividable by the number of threads, there will be a few
+       extra iterations. the first few threads will each get one of those, which
+       results in some offsetts that are applied to the start and end of the
+       chunks. */
+    else {
+      int chunksize = trip_count / nth;
+      int extras = trip_count % nth;
+      int tidextras = 0;
+      int incr = 0;
+      if (tid < extras) {
+        tidextras = tid;
+        incr = 0;
+      } else {
+        tidextras = extras;
+        incr = stride;
+      }
+      *threadlo = lo + (tid * chunksize + tidextras) * stride;
+      *threadhi = *threadlo + chunksize * stride - incr;
     }
   }
-  /* at least one iteration per thread. since the total number of iterations may
-     not be evenly dividable by the number of threads, there will be a few extra
-     iterations. the first few threads will each get one of those, which results
-     in some offsetts that are applied to the start and end of the chunks. */
-  else {
-    int chunksize = trip_count / nth;
-    int extras = trip_count % nth;
-    int tidextras = 0;
-    int incr = 0;
-    if (tid < extras) {
-      tidextras = tid;
-      incr = 0;
-    } else {
-      tidextras = extras;
-      incr = stride;
-    }
-    *threadlo = lo + (tid * chunksize + tidextras) * stride;
-    *threadhi = *threadlo + chunksize * stride - incr;
-  }
-}
   } // namespace clad
 #endif // CLAD_DIFFERENTIATOR
 

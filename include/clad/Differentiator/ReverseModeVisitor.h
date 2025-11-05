@@ -77,6 +77,12 @@ namespace clad {
     Stmts m_Globals;
     /// A flag indicating if the Stmt we are currently visiting is inside loop.
     bool isInsideLoop = false;
+    /// A flag indicating if the Stmt we are currently visiting is inside an
+    /// OpenMP parallel region.
+    bool isInsideOMPBlock = false;
+    /// A flag indicating ig the Stmt we are currently visiting is only for
+    /// capture.
+    bool isForCaptureOnly = false;
     /// Output variable of vector-valued function
     std::string outputArrayStr;
     std::vector<Stmts> m_LoopBlock;
@@ -239,7 +245,8 @@ namespace clad {
     /// global scope.
     clang::VarDecl* GlobalStoreImpl(clang::QualType Type,
                                     llvm::StringRef prefix,
-                                    clang::Expr* init = nullptr);
+                                    clang::Expr* init = nullptr,
+                                    clang::StorageClass SC = clang::SC_None);
     /// Creates a (global in the function scope) variable declaration, puts
     /// it into m_Globals block (to be inserted into the beginning of fn's
     /// body). Returns reference R to the created declaration. If E is not null,
@@ -604,6 +611,9 @@ namespace clad {
                                    clang::Stmt* forLoopIncDiff = nullptr,
                                    bool isForLoop = false);
 
+    StmtDiff DifferentiateCanonicalLoop(const clang::ForStmt* S,
+                                        bool isCaptureOnly = false);
+
     /// This class modifies forward and reverse blocks of the loop/switch
     /// body so that `break` and `continue` statements are correctly
     /// handled. `break` and `continue` statements are handled by
@@ -719,6 +729,8 @@ namespace clad {
     /// Builds and returns the sequence of derived function parameters.
     void BuildParams(llvm::SmallVectorImpl<clang::ParmVarDecl*>& params);
 
+    void MarkThreadPrivate(clang::Decl* decl);
+
     /// Stores data required for differentiating a switch statement.
     struct SwitchStmtInfo {
       llvm::SmallVector<clang::SwitchCase*, 16> cases;
@@ -737,8 +749,6 @@ namespace clad {
       m_SwitchStmtsData.emplace_back();
       return &m_SwitchStmtsData.back();
     }
-
-    StmtDiff DifferentiateCanonicalLoop(const clang::ForStmt* S);
 
     void PopSwitchStmtInfo() { m_SwitchStmtsData.pop_back(); }
 

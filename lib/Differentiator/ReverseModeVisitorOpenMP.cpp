@@ -12,13 +12,15 @@ using namespace clang;
 using namespace llvm::omp;
 
 namespace clad {
-StmtDiff ReverseModeVisitor::DifferentiateCanonicalLoop(const ForStmt* S) {
+StmtDiff ReverseModeVisitor::DifferentiateCanonicalLoop(const ForStmt* S,
+                                                        bool isCaptureOnly) {
   // OpenMP canonical loops have the form:
   // for (init-expr; test-expr; incr-expr) structured-block
   // where init-expr: var = lb
   //       test-expr: var relational-op ub
   //       incr-expr: ++var, var++, --var, var--, var += incr, var -= incr,
   //                  var = var + incr, var = incr + var, var = var - incr
+  beginScope(Scope::DeclScope | Scope::ControlScope);
 
   // Extract loop components
   const Stmt* Init = S->getInit();
@@ -122,6 +124,15 @@ StmtDiff ReverseModeVisitor::DifferentiateCanonicalLoop(const ForStmt* S) {
   // If stride is negative (decrement), negate it for getStaticSchedule
   if (!IsIncrement)
     Stride = BuildOp(UO_Minus, Stride);
+
+  llvm::SaveAndRestore<bool> SaveIsInsideLoop(isInsideLoop);
+  llvm::SaveAndRestore<bool> SaveIsForCaptureOnly(isForCaptureOnly);
+  if (!isCaptureOnly) {
+    // Set isInsideLoop to true to enable tape generation
+    // Save the previous value to restore it later
+    isInsideLoop = true;
+    isForCaptureOnly = true;
+  }
 
   // Create variables for chunk bounds: threadlo, threadhi
   QualType IntTy = m_Context.IntTy;
@@ -253,7 +264,7 @@ StmtDiff ReverseModeVisitor::DifferentiateCanonicalLoop(const ForStmt* S) {
     addToCurrentBlock(BuildDeclStmt(RevThreadLoDecl), direction::reverse);
     ReverseBlock = endBlock(direction::reverse);
   }
-
+  endScope();
   return {ForwardBlock, ReverseBlock};
 }
 
@@ -312,48 +323,42 @@ StmtDiff ReverseModeVisitor::VisitOMPExecutableDirective(
 
     // For reverse mode, we need to create two separate OpenMP regions:
     // one for the forward sweep and one for the reverse sweep.
-    // Each region needs its own ActOnOpenMPRegionStart/End to properly
-    // track variable captures.
 
-    // Create forward OpenMP region
-    Stmt* Forward = nullptr;
-    CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema).ActOnOpenMPRegionStart(
-        OMPD_parallel, getCurrentScope());
-    StmtDiff ForwardBodyDiff;
-    {
-      Sema::CompoundScopeRAII CompoundScope(m_Sema);
+    // Set the flag to indicate we are inside an OpenMP block
+    llvm::SaveAndRestore<bool> SaveisInsideOMPBlock(isInsideOMPBlock);
+    isInsideOMPBlock = true;
 
-      if (isOpenMPLoopDirective(D->getDirectiveKind())) {
-        const auto* FS = cast<ForStmt>(CS);
-        ForwardBodyDiff = DifferentiateCanonicalLoop(FS);
-      } else {
-        ForwardBodyDiff = Visit(CS);
-      }
-    }
-    Forward = CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema)
-                  .ActOnOpenMPRegionEnd(ForwardBodyDiff.getStmt(), OrigClauses)
-                  .get();
-
-    // Create reverse OpenMP region
-    // We need to re-differentiate to ensure proper variable capture tracking,
-    // but we'll use the reverse body from ForwardBodyDiff
-    Stmt* Reverse = nullptr;
-    CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema).ActOnOpenMPRegionStart(
-        OMPD_parallel, getCurrentScope());
-    // Re-differentiate to track captures in the reverse region
-    StmtDiff ReverseBodyDiff;
+    CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema).ActOnOpenMPRegionStart(OMPD_parallel,
+                                                                  nullptr);
+    StmtDiff BodyDiff;
     {
       Sema::CompoundScopeRAII CompoundScope(m_Sema);
       if (isOpenMPLoopDirective(D->getDirectiveKind())) {
         const auto* FS = cast<ForStmt>(CS);
-        ReverseBodyDiff = DifferentiateCanonicalLoop(FS);
+        BodyDiff = DifferentiateCanonicalLoop(FS);
       } else {
-        ReverseBodyDiff = Visit(CS);
+        BodyDiff = Visit(CS);
       }
     }
-    Reverse =
+    Stmt* Forward = CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema)
+                        .ActOnOpenMPRegionEnd(BodyDiff.getStmt(), OrigClauses)
+                        .get();
+
+    CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema).ActOnOpenMPRegionStart(OMPD_parallel,
+                                                                  nullptr);
+    // Visit twice, but use the first visit result, only for caputre variable.
+    {
+      Sema::CompoundScopeRAII CompoundScope(m_Sema);
+      if (isOpenMPLoopDirective(D->getDirectiveKind())) {
+        const auto* FS = cast<ForStmt>(CS);
+        DifferentiateCanonicalLoop(FS, /*isCaptureOnly=*/true);
+      } else {
+        Visit(CS);
+      }
+    }
+    Stmt* Reverse =
         CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema)
-            .ActOnOpenMPRegionEnd(ReverseBodyDiff.getStmt_dx(), DiffClauses)
+            .ActOnOpenMPRegionEnd(BodyDiff.getStmt_dx(), DiffClauses)
             .get();
 
     AssociatedSDiff = {Forward, Reverse};
@@ -376,7 +381,7 @@ StmtDiff ReverseModeVisitor::VisitOMPParallelForDirective(
     const clang::OMPParallelForDirective* D) {
   DeclarationNameInfo DirName;
   CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema).StartOpenMPDSABlock(
-      OMPD_parallel, DirName, getCurrentScope(), D->getBeginLoc());
+      OMPD_parallel, DirName, nullptr, D->getBeginLoc());
   StmtDiff SDiff = VisitOMPExecutableDirective(D);
   CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema).EndOpenMPDSABlock(SDiff.getStmt());
   return SDiff;
