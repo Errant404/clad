@@ -80,9 +80,6 @@ namespace clad {
     /// A flag indicating if the Stmt we are currently visiting is inside an
     /// OpenMP parallel region.
     bool isInsideOMPBlock = false;
-    /// A flag indicating ig the Stmt we are currently visiting is only for
-    /// capture.
-    bool isForCaptureOnly = false;
     /// Output variable of vector-valued function
     std::string outputArrayStr;
     std::vector<Stmts> m_LoopBlock;
@@ -321,6 +318,9 @@ namespace clad {
       /// demand in the method.
       clang::Expr* Last();
     };
+
+    std::stack<CladTapeResult> m_CanonicalLoopTapes;
+    bool isReverse = false;
 
     /// Make a clad::tape to store variables.
     /// If E is supposed to be stored in a tape, will create a global

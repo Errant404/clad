@@ -126,12 +126,9 @@ StmtDiff ReverseModeVisitor::DifferentiateCanonicalLoop(const ForStmt* S,
     Stride = BuildOp(UO_Minus, Stride);
 
   llvm::SaveAndRestore<bool> SaveIsInsideLoop(isInsideLoop);
-  llvm::SaveAndRestore<bool> SaveIsForCaptureOnly(isForCaptureOnly);
   if (!isCaptureOnly) {
     // Set isInsideLoop to true to enable tape generation
-    // Save the previous value to restore it later
     isInsideLoop = true;
-    isForCaptureOnly = true;
   }
 
   // Create variables for chunk bounds: threadlo, threadhi
@@ -185,6 +182,9 @@ StmtDiff ReverseModeVisitor::DifferentiateCanonicalLoop(const ForStmt* S,
   Stmt* ForwardLoop =
       new (m_Context) ForStmt(m_Context, FwdInit, FwdCond, nullptr, FwdInc,
                               BodyDiff.getStmt(), noLoc, noLoc, noLoc);
+
+  llvm::SaveAndRestore<bool> SaveIsReverse(isReverse);
+  isReverse = true;
 
   // For reverse loop, we need to create all variables first, then Visit
   // Create reverse chunk variables

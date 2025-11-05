@@ -25,7 +25,9 @@
 #include <cstddef>
 #include <cstring>
 #include <iterator>
+#ifdef _OPENMP
 #include <omp.h>
+#endif
 #include <type_traits>
 #include <utility>
 #ifndef __CUDACC__
@@ -788,6 +790,7 @@ CUDA_HOST_DEVICE void push(tape<T[N], SBO_SIZE, SLAB_SIZE>& to, const U& val) {
   // Gradient Structure for Reverse Mode Enzyme
   template <unsigned N> struct EnzymeGradient { double d_arr[N]; };
 
+#ifdef _OPENMP
   /* Static OpenMP scheduler, identical to what LLVM would use. Each thread gets
    one chunk of consecutive iterations. The number of iterations per chunk is
    aproximately trip_count/num_threads. If the trip count can not be evenly
@@ -837,6 +840,7 @@ CUDA_HOST_DEVICE void push(tape<T[N], SBO_SIZE, SLAB_SIZE>& to, const U& val) {
       *threadhi = *threadlo + chunksize * stride - incr;
     }
   }
+#endif
   } // namespace clad
 #endif // CLAD_DIFFERENTIATOR
 
