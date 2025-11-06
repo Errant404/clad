@@ -126,10 +126,8 @@ StmtDiff ReverseModeVisitor::DifferentiateCanonicalLoop(const ForStmt* S,
     Stride = BuildOp(UO_Minus, Stride);
 
   llvm::SaveAndRestore<bool> SaveIsInsideLoop(isInsideLoop);
-  if (!isCaptureOnly) {
-    // Set isInsideLoop to true to enable tape generation
-    isInsideLoop = true;
-  }
+  // Set isInsideLoop to true to enable tape generation
+  isInsideLoop = true;
 
   // Create variables for chunk bounds: threadlo, threadhi
   QualType IntTy = m_Context.IntTy;
@@ -186,31 +184,41 @@ StmtDiff ReverseModeVisitor::DifferentiateCanonicalLoop(const ForStmt* S,
   llvm::SaveAndRestore<bool> SaveIsReverse(isReverse);
   isReverse = true;
 
-  // For reverse loop, we need to create all variables first, then Visit
   // Create reverse chunk variables
   VarDecl* RevThreadLoDecl = BuildVarDecl(
       IntTy, CreateUniqueIdentifier("_t_chunklo"), getZeroInit(IntTy));
   VarDecl* RevThreadHiDecl = BuildVarDecl(
       IntTy, CreateUniqueIdentifier("_t_chunkhi"), getZeroInit(IntTy));
 
-  // Create reverse loop variable
-  IdentifierInfo* RevLoopVarII =
-      CreateUniqueIdentifier(LoopVarDecl->getNameAsString());
-  VarDecl* RevLoopVar = BuildVarDecl(LoopVarDecl->getType(), RevLoopVarII,
-                                     BuildDeclRef(RevThreadHiDecl));
+  // Reuse the forward loop variable declaration for reverse loop
+  // by creating a new VarDecl with the same identifier
+  VarDecl* RevLoopVar =
+      BuildVarDecl(FwdLoopVar->getType(), FwdLoopVar->getIdentifier(),
+                   BuildDeclRef(RevThreadHiDecl));
 
-  // For reverse loop, Visit again with the reverse loop variable
-  Stmt* ReverseLoopBody = nullptr;
-  if (BodyDiff.getStmt_dx()) {
-    // Register the reverse loop variable replacement
-    m_DeclReplacements[LoopVarDecl] = RevLoopVar;
+  // Get the reverse body - it already references FwdLoopVar
+  Stmt* ReverseLoopBody = BodyDiff.getStmt_dx();
 
-    // Visit the body again to get the reverse sweep with correct variable refs
-    StmtDiff RevBodyDiff = Visit(Body);
-    ReverseLoopBody = RevBodyDiff.getStmt_dx();
+  // We need to manually update all DeclRefExprs in the reverse body
+  // that refer to FwdLoopVar to refer to RevLoopVar instead
+  if (ReverseLoopBody) {
+    class LoopVarReplacer : public RecursiveASTVisitor<LoopVarReplacer> {
+    public:
+      VarDecl* OldVar;
+      VarDecl* NewVar;
 
-    // Clear the replacement
-    m_DeclReplacements.erase(LoopVarDecl);
+      LoopVarReplacer(VarDecl* oldVar, VarDecl* newVar)
+          : OldVar(oldVar), NewVar(newVar) {}
+
+      bool VisitDeclRefExpr(DeclRefExpr* DRE) const {
+        if (DRE->getDecl() == OldVar)
+          DRE->setDecl(NewVar);
+        return true;
+      }
+    };
+
+    LoopVarReplacer replacer(FwdLoopVar, RevLoopVar);
+    replacer.TraverseStmt(ReverseLoopBody);
   }
 
   // Create compound statement with declarations and loops
@@ -242,14 +250,14 @@ StmtDiff ReverseModeVisitor::DifferentiateCanonicalLoop(const ForStmt* S,
     Expr* RevScheduleCall =
         GetFunctionCall("GetStaticSchedule", "clad", RevScheduleCallArgs);
 
-    // Create the reverse loop using the already-created loop variable
+    // Create the reverse loop using the reverse loop variable
     Stmt* RevInit = BuildDeclStmt(RevLoopVar);
 
-    // Condition: i_rev >= threadlo
+    // Condition: rev_loop_var >= threadlo
     Expr* RevCond =
         BuildOp(BO_GE, BuildDeclRef(RevLoopVar), BuildDeclRef(RevThreadLoDecl));
 
-    // Decrement: i_rev -= stride
+    // Decrement: rev_loop_var -= stride
     Expr* RevInc =
         BuildOp(BO_SubAssign, BuildDeclRef(RevLoopVar), Clone(Stride));
 
@@ -349,12 +357,15 @@ StmtDiff ReverseModeVisitor::VisitOMPExecutableDirective(
     // Visit twice, but use the first visit result, only for caputre variable.
     {
       Sema::CompoundScopeRAII CompoundScope(m_Sema);
+      Stmts temp;
+      m_Globals.swap(temp);
       if (isOpenMPLoopDirective(D->getDirectiveKind())) {
         const auto* FS = cast<ForStmt>(CS);
         DifferentiateCanonicalLoop(FS, /*isCaptureOnly=*/true);
       } else {
         Visit(CS);
       }
+      m_Globals.swap(temp);
     }
     Stmt* Reverse =
         CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema)

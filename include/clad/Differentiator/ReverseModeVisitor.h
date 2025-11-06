@@ -319,7 +319,7 @@ namespace clad {
       clang::Expr* Last();
     };
 
-    std::stack<CladTapeResult> m_CanonicalLoopTapes;
+    std::queue<CladTapeResult> m_CanonicalLoopTapes;
     bool isReverse = false;
 
     /// Make a clad::tape to store variables.

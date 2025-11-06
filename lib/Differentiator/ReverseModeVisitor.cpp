@@ -141,7 +141,7 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
         MarkThreadPrivate(VD);
         m_CanonicalLoopTapes.push({*this, PushExpr, PopExpr, TapeRef});
       } else {
-        auto Res = m_CanonicalLoopTapes.top();
+        auto Res = m_CanonicalLoopTapes.front();
         m_CanonicalLoopTapes.pop();
         return Res;
       }
@@ -4650,23 +4650,21 @@ Expr* ReverseModeVisitor::getStdInitListSizeExpr(const Expr* E) {
     }
   }
   void ReverseModeVisitor::MarkThreadPrivate(Decl* decl) {
-    auto *Init = cast<VarDecl>(decl)->getInit();
+    auto* Init = cast<VarDecl>(decl)->getInit();
     // set to null to pass CheckOMPThreadPrivateDecl
     cast<VarDecl>(decl)->setInit(nullptr);
     auto* declRef = BuildDeclRef(cast<VarDecl>(decl));
     llvm::SmallVector<Expr*, 1> Vars;
     Vars.push_back(declRef);
     auto* TPDecl =
-            CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema).CheckOMPThreadPrivateDecl(
-                decl->getLocation(), Vars);
-        cast<VarDecl>(decl)->setInit(Init);
-      // Add the threadprivate declaration to the current context
-      m_Sema.CurContext->addDecl(TPDecl);
-      // Create a DeclStmt and add it to the global block for proper AST
-      // structure
-      Stmt* TPStmt =
-          new (m_Context) DeclStmt(DeclGroupRef(TPDecl), noLoc, noLoc);
-      AddToGlobalBlock(TPStmt);
-    
+        CLAD_COMPAT_CLANG19_SemaOpenMP(m_Sema).CheckOMPThreadPrivateDecl(
+            decl->getLocation(), Vars);
+    cast<VarDecl>(decl)->setInit(Init);
+    // Add the threadprivate declaration to the current context
+    m_Sema.CurContext->addDecl(TPDecl);
+    // Create a DeclStmt and add it to the global block for proper AST
+    // structure
+    Stmt* TPStmt = new (m_Context) DeclStmt(DeclGroupRef(TPDecl), noLoc, noLoc);
+    AddToGlobalBlock(TPStmt);
   }
 } // end namespace clad
